@@ -127,6 +127,16 @@ def test_resolve_project_phun_for_all_substring() -> None:
     assert result == (1325, "Phun For All - Sean Burns")
 
 
+def test_resolve_project_tokenizes_punctuation() -> None:
+    projects = [
+        {"id": 10, "name": "Refocus AI", "identifier": "refocus-ai"},
+        {"id": 99, "name": "Other Project", "identifier": "other"},
+    ]
+    with patch("agent._fetch_all_projects", return_value=projects):
+        result = _resolve_project("refocus.ai")
+    assert result == (10, "Refocus AI")
+
+
 def main() -> None:
     test_parse_date_range_all_returns_none()
     print("parse_date_range('all') -> None — OK")

@@ -1,6 +1,5 @@
-"""Tool-call helpers for the Redmine PM Assistant."""
+"""Helpers for the Redmine PM Assistant."""
 
-import json
 import re
 from datetime import date, datetime, timedelta
 
@@ -361,51 +360,24 @@ def parse_date_range(
     return None
 
 
-def extract_tool_call(content: str) -> dict | None:
-    if not content:
-        return None
-
-    match = re.search(
-        r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
-        content,
-        flags=re.DOTALL,
-    )
-
-    if not match:
-        return None
+def run_agent_turn(agent, question: str, allowed_tools: dict) -> str:
+    """Let the LangChain agent choose and execute tools, then return its answer."""
+    _ = allowed_tools
 
     try:
-        return json.loads(match.group(1))
-    except json.JSONDecodeError:
-        return None
-
-
-def run_agent_turn(agent, question: str, allowed_tools: dict) -> str:
-    result = agent.invoke(
-        {
-            "messages": [
-                {"role": "user", "content": question}
-            ]
-        }
-    )
+        result = agent.invoke(
+            {
+                "messages": [
+                    {"role": "user", "content": question}
+                ]
+            }
+        )
+    except Exception as exc:
+        return f"Agent execution error: {exc}"
 
     last_message = result["messages"][-1]
     content = last_message.content or ""
 
-    tool_call = extract_tool_call(content)
-
-    if tool_call:
-        tool_name = tool_call.get("name")
-        arguments = tool_call.get("arguments", {})
-
-        if tool_name not in allowed_tools:
-            return f"Tool not allowed: {tool_name}"
-
-        tool = allowed_tools[tool_name]
-
-        try:
-            return tool.invoke(arguments)
-        except Exception as exc:
-            return f"Tool execution error: {exc}"
-
-    return content
+    if isinstance(content, str):
+        return content
+    return str(content)

@@ -6,14 +6,14 @@ import pytest
 
 import agent
 from agent import (
-    APPROVE_KEYWORDS,
-    _handle_pending_draft_followup,
+    approve_pending_draft,
     clear_pending_draft,
     create_issue,
     create_issue_from_draft,
     draft_issue,
     get_pending_draft,
     redmine_post,
+    update_pending_issue_project,
 )
 
 _REDMINE_ENV = {
@@ -35,12 +35,9 @@ def _mock_response(status_code: int, json_body: object = None, text: str = "") -
     return response
 
 
-def test_approve_keywords_include_common_replies() -> None:
-    assert "approve" in APPROVE_KEYWORDS
-    assert "yes" in APPROVE_KEYWORDS
-    assert "go ahead" in APPROVE_KEYWORDS
-    assert "i approved" in APPROVE_KEYWORDS
-    assert "just create" in APPROVE_KEYWORDS
+def test_approval_is_handled_by_pending_draft_tool() -> None:
+    clear_pending_draft()
+    assert "no pending draft" in approve_pending_draft.invoke({}).lower()
 
 
 def test_draft_issue_stores_pending_draft() -> None:
@@ -57,10 +54,10 @@ def test_draft_issue_stores_pending_draft() -> None:
                 "project_identifier_or_id": "Association Analytics",
                 "assign_to_me": True,
             }
-        )
+    )
 
     assert "DRAFT ISSUE" in result
-    assert "Reply 'approve'" in result
+    assert "Tell me when to create it in Redmine" in result
     pending = get_pending_draft()
     assert pending is not None
     assert pending["title"] == "Automate dbt flow"
@@ -163,7 +160,9 @@ def test_pending_draft_use_project_updates_project() -> None:
         "agent._resolve_project",
         return_value=(1576, "Association Analytics"),
     ):
-        result = _handle_pending_draft_followup("use Association Analytics")
+        result = update_pending_issue_project.invoke(
+            {"project_identifier_or_id": "Association Analytics"}
+        )
 
     assert "Updated draft project to Association Analytics (#1576)" in result
     pending = get_pending_draft()
@@ -206,7 +205,10 @@ def test_pending_draft_use_project_and_approved_creates_issue(
     }
 
     with patch.dict("os.environ", {"REDMINE_URL": "https://redmine.example.com"}):
-        result = _handle_pending_draft_followup("use the association analyst, approved")
+        update_pending_issue_project.invoke(
+            {"project_identifier_or_id": "Association Analytics"}
+        )
+        result = approve_pending_draft.invoke({})
 
     assert "Created issue #9999" in result
     assert get_pending_draft() is None
@@ -300,8 +302,8 @@ def test_create_issue_includes_tracker_id_from_env() -> None:
 
 
 def main() -> None:
-    test_approve_keywords_include_common_replies()
-    print("APPROVE_KEYWORDS — OK")
+    test_approval_is_handled_by_pending_draft_tool()
+    print("approve_pending_draft — OK")
     test_draft_issue_stores_pending_draft()
     print("draft_issue stores pending draft — OK")
     test_create_issue_from_draft_without_project()

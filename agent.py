@@ -4,7 +4,7 @@ import difflib
 import os
 import re
 from datetime import date
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 
 import requests
 from langchain.agents import create_agent
@@ -24,88 +24,22 @@ _membership_users_cache: list[dict] | None = None
 _projects_cache: list[dict] | None = None
 _priority_cache: dict[str, int] | None = None
 _activity_cache: dict[str, int] | None = None
+_time_entry_custom_field_cache: dict[str, int] | None = None
 _tracker_cache: int | None = None
 _tracker_lookup_done: bool = False
 _pending_draft: dict | None = None
+_pending_clarification: dict | None = None
 
-_ISSUE_SEARCH_STOP_WORDS = frozenset(
-    {
-        "a",
-        "an",
-        "the",
-        "of",
-        "in",
-        "on",
-        "for",
-        "to",
-        "and",
-        "or",
-        "is",
-        "are",
-        "any",
-        "do",
-        "we",
-        "have",
-        "i",
-        "my",
-        "me",
-        "task",
-        "issue",
-        "ticket",
-    }
-)
 _ISSUE_ID_REF_RE = re.compile(r"^#?(\d+)$")
-_HOURS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:hours?|h)\b", re.IGNORECASE)
-
-APPROVE_KEYWORDS = frozenset(
-    {
-        "approve",
-        "yes",
-        "create",
-        "create it",
-        "go ahead",
-        "i approved",
-        "just create",
-        "create i approved",
-        "no need to assign any project just create",
-    }
-)
-
-_APPROVE_INTENT_RE = re.compile(
-    r"(?:^|[\s,])(?:"
-    r"approve[d]?|"
-    r"i\s+approved|"
-    r"just\s+create|"
-    r"create\s+i\s+approved|"
-    r"go\s+ahead|"
-    r"no\s+need\s+to\s+assign(?:\s+any\s+project)?\s+just\s+create|"
-    r"and\s+create(?:\s+it)?|"
-    r",\s*create(?:\s+it)?"
-    r")(?:$|[\s,])",
-    re.IGNORECASE,
-)
-
-_PROJECT_FOLLOWUP_RE = re.compile(
-    r"^(?:use\s+(?:the\s+)?(?:project\s+)?|in\s+(?:the\s+)?(?:project\s+)?|for\s+(?:the\s+)?(?:project\s+)?)(.+)$",
-    re.IGNORECASE,
-)
-
-_APPROVE_TRAILING_RE = re.compile(
-    r"[\s,]+(?:and\s+)?(?:"
-    r"create(?:\s+it)?|"
-    r"approved?|"
-    r"yes|"
-    r"go\s+ahead|"
-    r"i\s+approved|"
-    r"just\s+create"
-    r").*$",
-    re.IGNORECASE,
-)
 
 _ASSOCIATION_ANALYTICS_RE = re.compile(
     r"\bassociation\s+analy(?:tics|st)\b",
     re.IGNORECASE,
 )
+
+
+class AmbiguousUserMessage(str):
+    """User-facing ambiguity message that code can recognize without parsing wording."""
 
 
 def _redmine_configured() -> bool:
@@ -356,35 +290,44 @@ def create_issue_from_draft(draft: dict) -> str:
         return f"Redmine error: {exc}"
 
 
+def _issue_create_succeeded(answer: str) -> bool:
+    return answer.startswith("Created issue #") and "URL:" in answer
+
+
 def _store_pending_draft(draft: dict) -> None:
     global _pending_draft
     _pending_draft = draft
 
 
-def _has_approve_intent(question: str) -> bool:
-    lowered = question.lower().strip()
-    if lowered in APPROVE_KEYWORDS:
-        return True
-    if lowered in {"create", "yes"}:
-        return True
-    return _APPROVE_INTENT_RE.search(f" {lowered} ") is not None
+def _store_pending_clarification(clarification: dict) -> None:
+    global _pending_clarification
+    _pending_clarification = clarification
 
 
-def _extract_project_from_followup(question: str) -> str | None:
-    text = question.strip()
-    if not text:
-        return None
+def clear_pending_clarification() -> None:
+    global _pending_clarification
+    _pending_clarification = None
 
-    if _ASSOCIATION_ANALYTICS_RE.search(text):
-        return "Association Analytics"
 
-    match = _PROJECT_FOLLOWUP_RE.match(text)
-    if match:
-        name = _APPROVE_TRAILING_RE.sub("", match.group(1)).strip(" ,.")
-        if name:
-            return name
+def get_pending_clarification() -> dict | None:
+    return _pending_clarification
 
-    return None
+
+def _remember_user_clarification(
+    tool_name: str,
+    arguments: dict,
+    message: str,
+) -> str:
+    if isinstance(message, AmbiguousUserMessage):
+        _store_pending_clarification(
+            {
+                "tool": tool_name,
+                "missing_argument": "user_name",
+                "arguments": arguments,
+                "message": message,
+            }
+        )
+    return message
 
 
 def _approve_without_project_message() -> str:
@@ -395,52 +338,48 @@ def _approve_without_project_message() -> str:
     return (
         "Cannot create issue: no project specified.\n"
         f"{projects}\n"
-        "Specify project: reply 'use <project name>' then approve."
+        "Specify a project, then approve when you want it created."
     )
 
 
-def _handle_pending_draft_followup(question: str) -> str | None:
-    """Handle approve/project follow-ups for a pending draft. None => use LLM."""
+def _pending_draft_context() -> str:
     draft = get_pending_draft()
     if draft is None:
-        return None
+        return ""
 
     if draft.get("kind") == "time_entry":
-        return _handle_pending_time_draft_followup(question, draft)
-
-    approve = _has_approve_intent(question)
-    project_raw = _extract_project_from_followup(question)
-
-    if project_raw:
-        resolved = _resolve_project(project_raw)
-        if isinstance(resolved, str):
-            return resolved
-        if resolved is None:
-            return f"No project found matching '{project_raw}'."
-
-        project_id, project_name = resolved
-        draft["project_id"] = project_id
-        draft["project_name"] = project_name
-        _store_pending_draft(draft)
-
-        if approve:
-            answer = create_issue_from_draft(draft)
-            clear_pending_draft()
-            return answer
-
         return (
-            f"Updated draft project to {project_name} (#{project_id}). "
-            "Reply 'approve' to create."
+            "There is a pending time-entry draft. Decide whether the user is "
+            "providing missing hours/details, approving it, changing it, or asking "
+            "a new Redmine question. Use approve_pending_draft to post it when the "
+            "user approves, or update_pending_time_entry when the user provides "
+            "hours/date/activity/comments/billable hours/time-entry comments.\n"
+            f"Pending draft: {draft}"
         )
 
-    if approve:
-        if not draft.get("project_id"):
-            return _approve_without_project_message()
-        answer = create_issue_from_draft(draft)
-        clear_pending_draft()
-        return answer
+    return (
+        "There is a pending issue draft. Decide whether the user is approving it, "
+        "setting/changing its project, changing details, or asking a new Redmine "
+        "question. Use approve_pending_draft to create it when the user approves, "
+        "or update_pending_issue_project when the user provides a project.\n"
+        f"Pending draft: {draft}"
+    )
 
-    return None
+
+def _pending_clarification_context() -> str:
+    clarification = get_pending_clarification()
+    if clarification is None:
+        return ""
+
+    return (
+        "There is a pending clarification from the previous Redmine request. "
+        f"The previous tool was {clarification.get('tool')}; it is missing "
+        f"{clarification.get('missing_argument')}. Preserve the previous tool "
+        "arguments and use the user's reply as the missing value unless the user "
+        "clearly asks a new unrelated question.\n"
+        f"Previous arguments: {clarification.get('arguments', {})}\n"
+        f"Clarification message: {clarification.get('message', '')}"
+    )
 
 
 def _format_draft_message(draft: dict) -> str:
@@ -468,7 +407,7 @@ def _format_draft_message(draft: dict) -> str:
         lines.append("Assignee: Unassigned")
     lines.append(f"Description: {draft['description']}")
     lines.append(
-        "Reply 'approve' to create in Redmine, or 'use <project>' to set the project first."
+        "Tell me when to create it in Redmine, or provide a project to update the draft first."
     )
     return "\n".join(lines)
 
@@ -492,6 +431,45 @@ def _user_display_name(user: dict) -> str:
 
 
 _CURRENT_USER_ALIASES = frozenset({"me", "myself", "current user"})
+_USER_AMBIGUITY_LIMIT = 5
+
+
+def _normalize_lookup_text(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def _lookup_tokens(value: object) -> list[str]:
+    return [
+        token
+        for token in re.split(r"[\s._@'-]+", _normalize_lookup_text(value))
+        if token
+    ]
+
+
+def _user_identity_parts(user: dict) -> list[str]:
+    fields = [
+        _user_display_name(user),
+        user.get("login"),
+        user.get("firstname"),
+        user.get("lastname"),
+    ]
+    parts: list[str] = []
+    for field in fields:
+        normalized = _normalize_lookup_text(field)
+        if normalized:
+            parts.append(normalized)
+            parts.extend(_lookup_tokens(normalized))
+    return list(dict.fromkeys(parts))
+
+
+def _similarity(left: str, right: str) -> float:
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    if left in right or right in left:
+        return 0.95
+    return difflib.SequenceMatcher(None, left, right).ratio()
 
 
 def _get_current_user() -> tuple[int, str]:
@@ -503,19 +481,14 @@ def _get_current_user() -> tuple[int, str]:
 def _user_matches_name(user: dict, needle: str) -> bool:
     if needle in _CURRENT_USER_ALIASES:
         return False
-    name = _user_display_name(user).lower()
-    login = (user.get("login") or "").lower()
-    first = (user.get("firstname") or "").lower()
-    last = (user.get("lastname") or "").lower()
-    if needle == name or needle == login:
+    normalized_needle = _normalize_lookup_text(needle)
+    identity_parts = _user_identity_parts(user)
+    if normalized_needle in identity_parts:
         return True
-    if needle in name or needle in login:
+    if any(normalized_needle in part for part in identity_parts):
         return True
-    tokens = [t for t in needle.split() if t]
-    if tokens and all(
-        any(token in part for part in (first, last, name, login) if part)
-        for token in tokens
-    ):
+    tokens = _lookup_tokens(normalized_needle)
+    if tokens and all(any(token in part for part in identity_parts) for token in tokens):
         return True
     return False
 
@@ -567,43 +540,20 @@ _BILLABLE_FIELD_NAMES = frozenset(
 
 
 def _fuzzy_user_score(user: dict, needle: str) -> float:
-    name = _user_display_name(user).lower()
-    login = (user.get("login") or "").lower()
-    scores = [
-        difflib.SequenceMatcher(None, needle, name).ratio(),
-        difflib.SequenceMatcher(None, needle, login).ratio() if login else 0.0,
-    ]
-    needle_tokens = [t for t in needle.split() if t]
-    name_parts = [p for p in name.split() if p]
-    if login:
-        name_parts.append(login)
-    first = (user.get("firstname") or "").lower()
-    last = (user.get("lastname") or "").lower()
-    if first:
-        name_parts.append(first)
-    if last:
-        name_parts.append(last)
-    if needle_tokens and name_parts:
+    normalized_needle = _normalize_lookup_text(needle)
+    identity_parts = _user_identity_parts(user)
+    scores = [_similarity(normalized_needle, part) for part in identity_parts]
+
+    needle_tokens = _lookup_tokens(normalized_needle)
+    if needle_tokens and identity_parts:
         token_scores = [
-            max(
-                difflib.SequenceMatcher(None, token, part).ratio()
-                for part in name_parts
-                if part
-            )
+            max(_similarity(token, part) for part in identity_parts)
             for token in needle_tokens
         ]
         scores.append(sum(token_scores) / len(token_scores))
-        if all(
-            max(
-                difflib.SequenceMatcher(None, token, part).ratio()
-                for part in name_parts
-                if part
-            )
-            >= _FUZZY_TOKEN_THRESHOLD
-            for token in needle_tokens
-        ):
+        if all(score >= _FUZZY_TOKEN_THRESHOLD for score in token_scores):
             scores.append(0.85)
-    return max(scores)
+    return max(scores) if scores else 0.0
 
 
 def _fuzzy_match_users(users: list[dict], needle: str) -> list[tuple[dict, float]]:
@@ -626,8 +576,10 @@ def _resolve_user_fuzzy(
     if best_score - second_score >= _FUZZY_MATCH_MIN_GAP:
         user, _ = scored[0]
         return user["id"], _user_display_name(user)
-    names = ", ".join(_user_display_name(user) for user, _ in scored[:5])
-    return f"Multiple users match '{raw}': {names}. Please be more specific."
+    names = ", ".join(_user_display_name(user) for user, _ in scored[:_USER_AMBIGUITY_LIMIT])
+    return AmbiguousUserMessage(
+        f"Multiple users match '{raw}': {names}. Please be more specific."
+    )
 
 
 def _resolve_from_user_list(
@@ -638,8 +590,10 @@ def _resolve_from_user_list(
         user = matches[0]
         return user["id"], _user_display_name(user)
     if len(matches) > 1:
-        names = ", ".join(_user_display_name(u) for u in matches[:5])
-        return f"Multiple users match '{raw}': {names}. Please be more specific."
+        names = ", ".join(_user_display_name(u) for u in matches[:_USER_AMBIGUITY_LIMIT])
+        return AmbiguousUserMessage(
+            f"Multiple users match '{raw}': {names}. Please be more specific."
+        )
     return _resolve_user_fuzzy(users, raw, needle)
 
 
@@ -649,7 +603,7 @@ def _resolve_user(user_name: str) -> tuple[int, str] | str:
         return "user_name is required."
 
     raw = user_name.strip()
-    needle = raw.lower()
+    needle = _normalize_lookup_text(raw)
 
     if needle in _CURRENT_USER_ALIASES:
         try:
@@ -660,7 +614,8 @@ def _resolve_user(user_name: str) -> tuple[int, str] | str:
     global _users_api_search_allowed
     if _users_api_search_allowed is not False:
         try:
-            data = redmine_get(f"/users.json?name=~{raw}&status=1&limit=25")
+            query = quote(f"~{raw}", safe="")
+            data = redmine_get(f"/users.json?name={query}&status=1&limit=25")
             _users_api_search_allowed = True
             result = _resolve_from_user_list(data.get("users", []), raw, needle)
             if result is not None:
@@ -736,7 +691,7 @@ def _canonicalize_project_query(raw: str) -> str:
 
 
 def _project_query_tokens(needle: str) -> list[str]:
-    return [token for token in re.split(r"[\s\-_]+", needle.lower()) if token]
+    return _lookup_tokens(needle)
 
 
 def _project_token_match_score(project: dict, tokens: list[str]) -> float:
@@ -912,7 +867,7 @@ def _significant_issue_tokens(raw: str) -> list[str]:
     return [
         token
         for token in tokens
-        if token not in _ISSUE_SEARCH_STOP_WORDS and len(token) >= 2
+        if len(token) >= 3 or any(char.isdigit() for char in token)
     ]
 
 
@@ -1147,22 +1102,24 @@ def _entry_billable_status(entry: dict) -> bool | None:
     return None
 
 
-def _aggregate_billable_hours(entries: list[dict]) -> tuple[float, float, bool]:
-    """Return (billable_hours, non_billable_hours, field_present)."""
+def _aggregate_billable_hours(entries: list[dict]) -> tuple[float, float, float, bool]:
+    """Return billable, non-billable, unclassified hours, and whether the field appears."""
     billable = 0.0
     non_billable = 0.0
+    unclassified = 0.0
     field_seen = False
     for entry in entries:
+        hours = float(entry.get("hours") or 0)
         status = _entry_billable_status(entry)
         if status is None:
+            unclassified += hours
             continue
         field_seen = True
-        hours = float(entry.get("hours") or 0)
         if status:
             billable += hours
         else:
             non_billable += hours
-    return billable, non_billable, field_seen
+    return billable, non_billable, unclassified, field_seen
 
 
 def _format_time_summary(
@@ -1217,14 +1174,23 @@ def _format_time_summary(
     for issue_key, hours in top_issues:
         lines.append(f"  {issue_key}: {hours:.2f}h")
 
-    billable_hours, non_billable_hours, has_billable_field = _aggregate_billable_hours(
-        entries
-    )
+    (
+        billable_hours,
+        non_billable_hours,
+        unclassified_hours,
+        has_billable_field,
+    ) = _aggregate_billable_hours(entries)
     if has_billable_field:
         lines.append(
-            f"\nBy billable: {billable_hours:.2f}h billable, "
+            f"\nBillable breakdown for classified entries: "
+            f"{billable_hours:.2f}h billable, "
             f"{non_billable_hours:.2f}h non-billable"
         )
+        if unclassified_hours:
+            lines.append(
+                f"Unclassified hours: {unclassified_hours:.2f}h "
+                "(entries without a billable custom field or recognizable value)"
+            )
     else:
         lines.append(
             "\nBillable breakdown: not available — no billable custom field "
@@ -1491,8 +1457,22 @@ def get_user_time_logged(
     try:
         resolved_user = _resolve_user(user_name)
         if isinstance(resolved_user, str):
-            return resolved_user
+            return _remember_user_clarification(
+                "get_user_time_logged",
+                {
+                    "project_identifier_or_id": project_identifier_or_id,
+                    "date_range": date_range,
+                    "issue_keyword": issue_keyword,
+                },
+                resolved_user,
+            )
         user_id, display_name = resolved_user
+        pending_clarification = get_pending_clarification()
+        if (
+            pending_clarification
+            and pending_clarification.get("tool") == "get_user_time_logged"
+        ):
+            clear_pending_clarification()
 
         project_name = None
         query = f"user_id={user_id}"
@@ -1819,14 +1799,83 @@ def _resolve_activity_id(activity_name: str) -> int | str:
     return f"Unknown activity '{activity_name}'. Available: {available}."
 
 
-def _extract_hours_from_text(text: str) -> float | None:
-    match = _HOURS_RE.search(text)
-    if match:
-        return float(match.group(1))
-    stripped = text.strip()
-    if re.match(r"^\d+(?:\.\d+)?$", stripped):
-        return float(stripped)
+def _normalize_custom_field_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def _time_entry_custom_fields() -> dict[str, int]:
+    global _time_entry_custom_field_cache
+    if _time_entry_custom_field_cache is not None:
+        return _time_entry_custom_field_cache
+
+    data = redmine_get("/custom_fields.json")
+    fields: dict[str, int] = {}
+    for field in data.get("custom_fields", []):
+        if field.get("customized_type") != "time_entry":
+            continue
+        field_id = field.get("id")
+        name = field.get("name")
+        if field_id and name:
+            fields[_normalize_custom_field_name(name)] = int(field_id)
+    _time_entry_custom_field_cache = fields
+    return fields
+
+
+def _resolve_time_entry_custom_field_id(
+    env_var: str,
+    names: tuple[str, ...],
+) -> int | str | None:
+    env_value = os.getenv(env_var, "").strip()
+    if env_value.isdigit():
+        return int(env_value)
+
+    try:
+        fields = _time_entry_custom_fields()
+    except (requests.RequestException, RuntimeError, KeyError, ValueError) as exc:
+        return (
+            f"Could not resolve time-entry custom fields from Redmine: {exc}. "
+            f"Set {env_var} in .env."
+        )
+
+    normalized_names = [_normalize_custom_field_name(name) for name in names]
+    for normalized_name in normalized_names:
+        if normalized_name in fields:
+            return fields[normalized_name]
+
+    for field_name, field_id in fields.items():
+        if any(name in field_name or field_name in name for name in normalized_names):
+            return field_id
+
     return None
+
+
+def _time_entry_custom_fields_payload(draft: dict) -> list[dict] | str:
+    custom_fields: list[dict] = []
+
+    if draft.get("billable_hours") is not None:
+        field_id = _resolve_time_entry_custom_field_id(
+            "REDMINE_BILLABLE_HOURS_CUSTOM_FIELD_ID",
+            ("Billable Hours", "Billable", "Billable Time"),
+        )
+        if isinstance(field_id, str):
+            return field_id
+        if field_id is not None:
+            custom_fields.append(
+                {"id": field_id, "value": str(draft.get("billable_hours"))}
+            )
+
+    time_entry_comments = (draft.get("time_entry_comments") or "").strip()
+    if time_entry_comments:
+        field_id = _resolve_time_entry_custom_field_id(
+            "REDMINE_TIME_ENTRY_COMMENTS_CUSTOM_FIELD_ID",
+            ("Time Entry Comments", "Time Entry Comment", "Comments"),
+        )
+        if isinstance(field_id, str):
+            return field_id
+        if field_id is not None:
+            custom_fields.append({"id": field_id, "value": time_entry_comments})
+
+    return custom_fields
 
 
 def _resolve_issue_for_time_entry(issue_id_or_keyword: str) -> tuple[int, str] | str:
@@ -1873,10 +1922,14 @@ def _format_time_draft_message(draft: dict) -> str:
     ]
     if draft.get("comments"):
         lines.append(f"Comments: {draft['comments']}")
+    if draft.get("billable_hours") is not None:
+        lines.append(f"Billable Hours: {draft['billable_hours']}")
+    if draft.get("time_entry_comments"):
+        lines.append(f"Time Entry Comments: {draft['time_entry_comments']}")
     if not isinstance(hours, (int, float)) or hours <= 0:
-        lines.append("How many hours should I log? Reply with hours (e.g. '4 hours'), then 'approve'.")
+        lines.append("How many hours should I log?")
     else:
-        lines.append("Reply 'approve' to log this time in Redmine.")
+        lines.append("Tell me when to log this time in Redmine.")
     return "\n".join(lines)
 
 
@@ -1901,6 +1954,11 @@ def create_time_entry_from_draft(draft: dict) -> str:
             "comments": draft.get("comments", ""),
         }
     }
+    custom_fields = _time_entry_custom_fields_payload(draft)
+    if isinstance(custom_fields, str):
+        return custom_fields
+    if custom_fields:
+        payload["time_entry"]["custom_fields"] = custom_fields
     try:
         data = redmine_post("/time_entries.json", payload)
         entry = data.get("time_entry") if isinstance(data, dict) else None
@@ -1915,27 +1973,8 @@ def create_time_entry_from_draft(draft: dict) -> str:
         return f"Redmine error: {exc}"
 
 
-def _handle_pending_time_draft_followup(question: str, draft: dict) -> str | None:
-    hours = _extract_hours_from_text(question)
-    if hours is not None and hours > 0:
-        draft["hours"] = hours
-        _store_pending_draft(draft)
-
-    approve = _has_approve_intent(question)
-    if approve:
-        if not isinstance(draft.get("hours"), (int, float)) or draft["hours"] <= 0:
-            return (
-                f"To log time on #{draft['issue_id']}, how many hours should I log? "
-                "Reply with hours (e.g. '4 hours'), then 'approve'."
-            )
-        answer = create_time_entry_from_draft(draft)
-        clear_pending_draft()
-        return answer
-
-    if hours is not None and hours > 0:
-        return _format_time_draft_message(draft)
-
-    return None
+def _time_entry_create_succeeded(answer: str) -> bool:
+    return answer.startswith("Logged ") and "Time entry id:" in answer
 
 
 def _build_time_entry_draft(
@@ -1944,6 +1983,8 @@ def _build_time_entry_draft(
     spent_on: str = "",
     activity: str = "",
     comments: str = "",
+    billable_hours: float | None = None,
+    time_entry_comments: str = "",
 ) -> tuple[dict, str | None]:
     resolved_issue = _resolve_issue_for_time_entry(issue_id_or_keyword)
     if isinstance(resolved_issue, str):
@@ -1974,6 +2015,8 @@ def _build_time_entry_draft(
         "activity_id": activity_id,
         "activity_name": activity_name.title() if activity_name != "Default" else activity_name,
         "comments": comments.strip(),
+        "billable_hours": billable_hours,
+        "time_entry_comments": time_entry_comments.strip(),
     }
     return draft, None
 
@@ -1985,13 +2028,21 @@ def draft_time_entry(
     spent_on: str = "",
     activity: str = "",
     comments: str = "",
+    billable_hours: float | None = None,
+    time_entry_comments: str = "",
 ) -> str:
-    """Draft a time entry for PM review. Does NOT log in Redmine until the user replies approve.
+    """Draft a time entry for PM review. Does NOT log in Redmine until approved.
 
     hours is required before logging — if missing or zero, the tool asks how many hours."""
     try:
         draft, error = _build_time_entry_draft(
-            issue_id_or_keyword, hours, spent_on, activity, comments
+            issue_id_or_keyword,
+            hours,
+            spent_on,
+            activity,
+            comments,
+            billable_hours,
+            time_entry_comments,
         )
         if error:
             return error
@@ -2000,7 +2051,7 @@ def draft_time_entry(
         if not isinstance(draft.get("hours"), (int, float)) or draft["hours"] <= 0:
             return (
                 f"To log time on #{draft['issue_id']} ({draft['issue_subject']}), "
-                "how many hours should I log? Reply with hours (e.g. '4 hours'), then 'approve'."
+                "how many hours should I log?"
             )
         return _format_time_draft_message(draft)
     except (requests.RequestException, RuntimeError, KeyError) as exc:
@@ -2014,6 +2065,8 @@ def log_time(
     spent_on: str = "",
     activity: str = "",
     comments: str = "",
+    billable_hours: float | None = None,
+    time_entry_comments: str = "",
 ) -> str:
     """Log time on an issue immediately (no draft/approve step). hours is required."""
     if not isinstance(hours, (int, float)) or hours <= 0:
@@ -2023,13 +2076,55 @@ def log_time(
         )
     try:
         draft, error = _build_time_entry_draft(
-            issue_id_or_keyword, hours, spent_on, activity, comments
+            issue_id_or_keyword,
+            hours,
+            spent_on,
+            activity,
+            comments,
+            billable_hours,
+            time_entry_comments,
         )
         if error:
             return error
         return create_time_entry_from_draft(draft)
     except (requests.RequestException, RuntimeError, KeyError) as exc:
         return f"Redmine error: {exc}"
+
+
+@tool
+def update_pending_time_entry(
+    hours: float = 0,
+    spent_on: str = "",
+    activity: str = "",
+    comments: str = "",
+    billable_hours: float | None = None,
+    time_entry_comments: str = "",
+) -> str:
+    """Update the pending time-entry draft with hours, date, activity, comments, or billable fields."""
+    draft = get_pending_draft()
+    if not draft or draft.get("kind") != "time_entry":
+        return "There is no pending time-entry draft to update."
+
+    if isinstance(hours, (int, float)) and hours > 0:
+        draft["hours"] = hours
+    if spent_on.strip():
+        draft["spent_on"] = spent_on.strip()
+    if activity.strip():
+        activity_id = _resolve_activity_id(activity)
+        if isinstance(activity_id, str):
+            return activity_id
+        draft["activity"] = activity.strip()
+        draft["activity_id"] = activity_id
+        draft["activity_name"] = activity.strip().title()
+    if comments.strip():
+        draft["comments"] = comments.strip()
+    if billable_hours is not None:
+        draft["billable_hours"] = billable_hours
+    if time_entry_comments.strip():
+        draft["time_entry_comments"] = time_entry_comments.strip()
+
+    _store_pending_draft(draft)
+    return _format_time_draft_message(draft)
 
 
 @tool
@@ -2040,7 +2135,7 @@ def draft_issue(
     project_identifier_or_id: str = "",
     assign_to_me: bool = True,
 ) -> str:
-    """Draft a new issue for PM review. Does NOT create in Redmine until the user replies approve."""
+    """Draft a new issue for PM review. Does NOT create in Redmine until approved."""
     try:
         project_id, project_name, project_error = _resolve_draft_project(
             project_identifier_or_id
@@ -2063,6 +2158,29 @@ def draft_issue(
         return _format_draft_message(draft)
     except (requests.RequestException, RuntimeError, KeyError) as exc:
         return f"Redmine error: {exc}"
+
+
+@tool
+def update_pending_issue_project(project_identifier_or_id: str) -> str:
+    """Set or change the project on the pending issue draft."""
+    draft = get_pending_draft()
+    if not draft or draft.get("kind") == "time_entry":
+        return "There is no pending issue draft to update."
+
+    resolved = _resolve_project(project_identifier_or_id)
+    if isinstance(resolved, str):
+        return resolved
+    if resolved is None:
+        return f"No project found matching '{project_identifier_or_id}'."
+
+    project_id, project_name = resolved
+    draft["project_id"] = project_id
+    draft["project_name"] = project_name
+    _store_pending_draft(draft)
+    return (
+        f"Updated draft project to {project_name} (#{project_id}). "
+        "Ask me to approve it when you want it created."
+    )
 
 
 @tool
@@ -2101,6 +2219,34 @@ def create_issue_in_redmine(
         return f"Redmine error: {exc}"
 
 
+@tool
+def approve_pending_draft() -> str:
+    """Create/log the currently pending draft after the user approves it."""
+    draft = get_pending_draft()
+    if draft is None:
+        return "There is no pending draft to approve."
+
+    try:
+        if draft.get("kind") == "time_entry":
+            if not isinstance(draft.get("hours"), (int, float)) or draft["hours"] <= 0:
+                return (
+                    f"To log time on #{draft['issue_id']}, how many hours should I log?"
+                )
+            answer = create_time_entry_from_draft(draft)
+            if _time_entry_create_succeeded(answer):
+                clear_pending_draft()
+            return answer
+
+        if not draft.get("project_id"):
+            return _approve_without_project_message()
+        answer = create_issue_from_draft(draft)
+        if _issue_create_succeeded(answer):
+            clear_pending_draft()
+        return answer
+    except (requests.RequestException, RuntimeError, KeyError) as exc:
+        return f"Redmine error: {exc}"
+
+
 ALL_TOOLS = {
     "get_my_profile": get_my_profile,
     "list_my_projects": list_my_projects,
@@ -2119,309 +2265,58 @@ ALL_TOOLS = {
     "get_last_logged_day": get_last_logged_day,
     "draft_time_entry": draft_time_entry,
     "log_time": log_time,
+    "update_pending_time_entry": update_pending_time_entry,
     "draft_issue": draft_issue,
+    "update_pending_issue_project": update_pending_issue_project,
     "create_issue_in_redmine": create_issue_in_redmine,
+    "approve_pending_draft": approve_pending_draft,
 }
 
 REDMINE_SYSTEM_PROMPT = """
-You are a Redmine PM Assistant.
-
-Your job is to understand the user's intention and choose the correct Redmine tool.
-
-You MUST use a tool for every Redmine-related question.
-Do not answer from memory.
-Do not say you cannot access Redmine.
-Do not explain which tool you are choosing.
-
-When you need a tool, respond ONLY in this exact format:
-
-<tool_call>{"name": "tool_name", "arguments": {...}}</tool_call>
-
-Do not write anything before or after the <tool_call> block.
-
-TOOL DISAMBIGUATION (read first):
-- "who is the project manager / PM / lead / who manages / who leads <project>"
-  => ALWAYS get_project_manager. NEVER list_my_projects, NEVER get_project_status.
-- "my projects / list my projects / which projects am I in"
-  => list_my_projects ONLY — never for another person's projects or a project's roster.
-- "list members / developers / who is on the team / project roster for <project>"
-  => list_project_members — NOT list_my_projects.
-- "projects of <person> / which projects is <name> on"
-  => list_user_projects — NOT list_my_projects.
-- "time per developer / each member's hours / report by member on <project>"
-  => get_project_time_by_member — NOT get_project_time_logged (that is project total only).
-- "total project time / team hours on <project>" (no per-person breakdown)
-  => get_project_time_logged — NOT get_project_time_by_member.
-- A question naming a specific project AND asking who runs/manages/leads it is NEVER list_my_projects.
-- "when did I last log time" / "what is the last day I logged time" / "most recent time entry"
-  => ALWAYS get_last_logged_day. NEVER get_my_time_logged with date_range.
-- get_my_time_logged date_range filters hours ON a period (yesterday, this week). get_last_logged_day
-  finds the calendar date of the newest time entry. "last day" alone as a date filter => yesterday;
-  "last day I logged (time)" => get_last_logged_day.
-- "log/add/record time on issue/task" (WRITE) => draft_time_entry or log_time. NEVER get_my_time_logged.
-- "how much time did I log" (READ) => get_my_time_logged. NEVER draft_time_entry.
-- Numeric issue refs (#174022, 174022) => get_issue or pass as issue_id_or_keyword / issue_keyword — not subject search.
-
-Negative examples (do NOT do this):
-User: who is the project manager of Association Analytics?
-WRONG: <tool_call>{"name": "list_my_projects", "arguments": {}}</tool_call>
-RIGHT: <tool_call>{"name": "get_project_manager", "arguments": {"project_identifier_or_id": "Association Analytics"}}</tool_call>
-
-Available tools and when to use them:
-
-1. get_my_profile
-Use when the user asks about their Redmine profile, account, user details, or asks who they are.
-
-2. list_my_projects
-Use ONLY when the user asks for their own projects or which projects they are part of.
-Do NOT use for who manages a project, project member lists, or another user's projects.
-
-2b. list_project_members
-Use when the user asks to list members, developers, or team roster for a specific project.
-
-2c. list_user_projects
-Use when the user asks which projects a named person belongs to.
-
-3. list_my_issues
-Use when the user asks for their own issues, tasks, assigned issues, pending work, or open tasks assigned to them.
-
-4. search_issues
-Use when the user wants to search issues by keyword, topic, module, feature, bug name, or subject.
-Searches open, New, and closed issues (not open-only). Matches ANY significant keyword token with
-prefix/fuzzy matching — e.g. "dbt automatic flow" can find "Automate dbt flow".
-If the user gives a numeric issue id (#174022 or 174022), use get_issue instead.
-
-5. search_high_priority_issues
-Use when the user asks for urgent, high priority, blocker, critical, or immediate issues.
-
-6. get_issue
-Use when the user asks about a specific Redmine issue number (#174022 or 174022).
-
-7. get_project_status
-Use when the user asks about project status, project health, open issue count, or closed issue count.
-Do NOT use for who manages or leads a project — use get_project_manager instead.
-This tool requires project_id as an integer.
-
-WEEKEND AND DATE RANGE (tools 8–11):
-- Pass date_range as natural language for the period the user means, or as YYYY-MM-DD for one day, or YYYY-MM-DD..YYYY-MM-DD for a range.
-- You may convert relative phrases (e.g. "last month", a named Saturday) to ISO dates before calling the tool.
-- Use empty string "" or "all" when no date filter is needed.
-- Date phrases belong in date_range, not project_identifier_or_id — except when "all" is part of a project name (e.g. "Phun For All"); pass the full project name as-is.
-
-8. get_my_time_logged
-Use ONLY when the user asks about their own logged time — words like I, me, my, myself.
-If the user mentions another person's name (e.g. Rauf, Abdul Rauf), use get_user_time_logged instead.
-If the user says their own full name after asking about their time, still use get_my_time_logged.
-
-Arguments:
-- project_identifier_or_id: project name, project identifier, or numeric project id.
-- Use empty string "" when the user does not mention a project.
-- date_range: optional — natural language, YYYY-MM-DD, YYYY-MM-DD..YYYY-MM-DD, or "from YYYY-MM-DD till today"; "" or "all" for no filter.
-- issue_keyword: optional — subject keywords (e.g. "dbt skills") OR numeric issue id (#174022 or 174022).
-
-Important:
-- If the user asks only about their own time with no project, use project_identifier_or_id="".
-- If the user asks about their time on a project, pass that project name/id.
-- If the user asks about their time on a project and date, pass both.
-- If the user asks about time logged on a ticket (e.g. "dbt ticket of the skills"), pass issue_keyword and date_range; do not call get_user_time_logged with a name.
-
-Examples:
-User: how many hours did I log yesterday?
-Response:
-<tool_call>{"name": "get_my_time_logged", "arguments": {"project_identifier_or_id": "", "date_range": "yesterday", "issue_keyword": ""}}</tool_call>
-
-User: my time this week
-Response:
-<tool_call>{"name": "get_my_time_logged", "arguments": {"project_identifier_or_id": "", "date_range": "this week", "issue_keyword": ""}}</tool_call>
-
-User: how much time did I log last weekend?
-Response:
-<tool_call>{"name": "get_my_time_logged", "arguments": {"project_identifier_or_id": "", "date_range": "last weekend", "issue_keyword": ""}}</tool_call>
-
-User: my time on Saturday
-Response:
-<tool_call>{"name": "get_my_time_logged", "arguments": {"project_identifier_or_id": "", "date_range": "YYYY-MM-DD", "issue_keyword": ""}}</tool_call>
-(Use the actual Saturday date in YYYY-MM-DD when the user names a specific day.)
-
-User: how much time did I spend on Association Analytics yesterday?
-Response:
-<tool_call>{"name": "get_my_time_logged", "arguments": {"project_identifier_or_id": "Association Analytics", "date_range": "yesterday", "issue_keyword": ""}}</tool_call>
-
-User: logged the time in the dbt ticket of the skills from 2026-06-08 till today
-Response:
-<tool_call>{"name": "get_my_time_logged", "arguments": {"project_identifier_or_id": "", "date_range": "from 2026-06-08 till today", "issue_keyword": "dbt skills"}}</tool_call>
-
-User: add the time logged on task 174022
-Response:
-<tool_call>{"name": "draft_time_entry", "arguments": {"issue_id_or_keyword": "174022", "hours": 0, "spent_on": "", "activity": "", "comments": ""}}</tool_call>
-(hours=0 when the user did not specify hours — the tool will ask how many hours.)
-
-8b. get_last_logged_day
-Use when the user asks WHEN they last logged time, the most recent date they logged time,
-their last time entry date, or when a named person last logged — NOT how many hours on a date.
-
-This is NOT get_my_time_logged. Do NOT pass date_range or interpret "last day I logged" as yesterday.
-
-Arguments:
-- user_name: "" for the current user; person's name or login when asking about someone else.
-
-Examples:
-User: what is the last day I logged time?
-Response:
-<tool_call>{"name": "get_last_logged_day", "arguments": {"user_name": ""}}</tool_call>
-
-User: when did I last log time?
-Response:
-<tool_call>{"name": "get_last_logged_day", "arguments": {"user_name": ""}}</tool_call>
-
-User: when did Rauf last log time?
-Response:
-<tool_call>{"name": "get_last_logged_day", "arguments": {"user_name": "Rauf"}}</tool_call>
-
-9. get_project_time_logged
-Use when the user asks about total project time by all users combined — team hours, everyone's
-time aggregated, or total time spent on a project. Does NOT break down per developer.
-
-Arguments:
-- project_identifier_or_id is required.
-- date_range: optional — natural language or YYYY-MM-DD / YYYY-MM-DD..YYYY-MM-DD; "" or "all" for no filter.
-
-9b. get_project_time_by_member
-Use when the user wants per-developer or per-member time on a project — complete report with
-each person's hours, time log by each developer, or member breakdown.
-
-Arguments:
-- project_identifier_or_id is required.
-- date_range: optional — same as get_project_time_logged.
-
-Examples:
-User: complete report for Association Analytics with time log by each developer
-Response:
-<tool_call>{"name": "get_project_time_by_member", "arguments": {"project_identifier_or_id": "Association Analytics", "date_range": ""}}</tool_call>
-
-User: list all developers on Association Analytics
-Response:
-<tool_call>{"name": "list_project_members", "arguments": {"project_identifier_or_id": "Association Analytics"}}</tool_call>
-
-User: list projects of uzair aziz
-Response:
-<tool_call>{"name": "list_user_projects", "arguments": {"user_name": "uzair aziz"}}</tool_call>
-
-Examples:
-User: total time spent on Association Analytics
-Response:
-<tool_call>{"name": "get_project_time_logged", "arguments": {"project_identifier_or_id": "Association Analytics", "date_range": ""}}</tool_call>
-
-User: team hours on Association Analytics last week
-Response:
-<tool_call>{"name": "get_project_time_logged", "arguments": {"project_identifier_or_id": "Association Analytics", "date_range": "last week"}}</tool_call>
-
-User: team hours on Association Analytics this weekend
-Response:
-<tool_call>{"name": "get_project_time_logged", "arguments": {"project_identifier_or_id": "Association Analytics", "date_range": "this weekend"}}</tool_call>
-
-11. get_user_time_logged
-Use when the user asks about time logged by a specific person, team member, or colleague — not their own time.
-Includes billable vs non-billable breakdown when the Redmine time entry API returns a billable custom field.
-Do NOT use when the user says I/me/my, or clarifies with their own name after a self time query.
-
-Arguments:
-- user_name: person's name or login (e.g. "rauf", "Abdul Rauf", "abdul.rauf")
-- project_identifier_or_id: optional project filter; use "" if not mentioned. Pass the full project name even if it contains words like "all".
-- date_range: optional — natural language or YYYY-MM-DD / YYYY-MM-DD..YYYY-MM-DD; "" or "all" for no filter.
-- issue_keyword: optional — subject keywords when filtering to a specific ticket/issue.
-
-Examples:
-User: how much time did Rauf log last month?
-Response:
-<tool_call>{"name": "get_user_time_logged", "arguments": {"user_name": "Rauf", "project_identifier_or_id": "", "date_range": "last month"}}</tool_call>
-
-User: hours logged by Abdul Rauf on Association Analytics this week
-Response:
-<tool_call>{"name": "get_user_time_logged", "arguments": {"user_name": "Abdul Rauf", "project_identifier_or_id": "Association Analytics", "date_range": "this week"}}</tool_call>
-
-User: how much time did Rauf log last weekend?
-Response:
-<tool_call>{"name": "get_user_time_logged", "arguments": {"user_name": "Rauf", "project_identifier_or_id": "", "date_range": "last weekend"}}</tool_call>
-
-User: how much time hamza bhatti logged in Phun For All
-Response:
-<tool_call>{"name": "get_user_time_logged", "arguments": {"user_name": "hamza bhatti", "project_identifier_or_id": "Phun For All", "date_range": ""}}</tool_call>
-
-User: add the time logged from my recent to till today in the task 174022
-Response:
-<tool_call>{"name": "draft_time_entry", "arguments": {"issue_id_or_keyword": "174022", "hours": 0, "spent_on": "", "activity": "", "comments": ""}}</tool_call>
-(hours unknown — draft_time_entry asks how many hours; user replies with hours then approve)
-
-13. draft_time_entry
-Use when the user wants to LOG/ADD/RECORD time on an issue (write operation), not query hours.
-Requires hours before posting — if the user did not say how many hours, pass hours=0; the tool asks
-"How many hours?". The CLI intercepts follow-ups: reply with "4 hours" then "approve" to POST.
-
-Arguments:
-- issue_id_or_keyword: issue number (#174022, 174022) or subject keywords ("dbt flow")
-- hours: required to log — use 0 when unknown so the tool prompts for hours
-- spent_on: optional YYYY-MM-DD (default today)
-- activity: optional activity name
-- comments: optional note
-
-Examples:
-User: log 3 hours on #174022 today
-Response:
-<tool_call>{"name": "draft_time_entry", "arguments": {"issue_id_or_keyword": "174022", "hours": 3, "spent_on": "", "activity": "", "comments": ""}}</tool_call>
-
-User: log time on the dbt flow task
-Response:
-<tool_call>{"name": "draft_time_entry", "arguments": {"issue_id_or_keyword": "dbt flow", "hours": 0, "spent_on": "", "activity": "", "comments": ""}}</tool_call>
-
-14. log_time
-Use when the user explicitly asks to log time NOW without a draft step AND stated hours.
-Do NOT use when hours are missing — use draft_time_entry with hours=0 instead.
-
-Arguments: same as draft_time_entry; hours is required (> 0).
-
-10. draft_issue
-Use when the user wants to create, draft, raise, add, or report a new issue or bug.
-This tool only drafts the issue locally. It does NOT create it in Redmine.
-The application intercepts draft follow-ups in the CLI (no LLM): "approve", "yes", "create", "i approved", "just create", and "use <project>" / "in <project>" to set the project on the pending draft. Do NOT call draft_issue or list_my_projects for those short follow-ups.
-
-Arguments:
-- title
-- description
-- priority: default Normal unless the user says High, Urgent, Low, etc.
-- project_identifier_or_id: project name, identifier, or numeric id; use "" if not mentioned (falls back to REDMINE_DEFAULT_PROJECT_ID env).
-- assign_to_me: true when the user wants the issue assigned to themselves (default true).
-
-Examples:
-User: create a task for automating the dbt flow, assign to me
-Response:
-<tool_call>{"name": "draft_issue", "arguments": {"title": "Automate dbt flow", "description": "...", "priority": "Normal", "project_identifier_or_id": "", "assign_to_me": true}}</tool_call>
-
-11. create_issue_in_redmine
-Use when the user explicitly asks to create/log/add an issue NOW without a draft step
-(e.g. "create it now", "log this bug immediately", "add issue to Redmine").
-
-Arguments:
-- title, description, project_identifier_or_id (required unless REDMINE_DEFAULT_PROJECT_ID is set)
-- priority: default Normal
-- assign_to_me: default true
-
-12. get_project_manager
-Use when the user asks who manages, leads, or is the project manager (PM) of a project.
-
-Arguments:
-- project_identifier_or_id: project name, identifier, or numeric id.
-
-Examples:
-User: who is the project manager of Association Analytics?
-Response:
-<tool_call>{"name": "get_project_manager", "arguments": {"project_identifier_or_id": "Association Analytics"}}</tool_call>
-
-User: who leads project 1576?
-Response:
-<tool_call>{"name": "get_project_manager", "arguments": {"project_identifier_or_id": "1576"}}</tool_call>
-
-Return only the tool call.
+You are a Redmine PM Assistant. Understand the user's intent and choose the
+single best Redmine tool through native tool calling.
+
+Rules:
+- Use tools for Redmine-related requests. Do not answer Redmine facts from memory.
+- Do not print JSON, XML, or pseudo tool-call text.
+- After a tool runs, return the tool result or a short user-facing summary.
+- If a request is ambiguous, choose the safest read-only tool or ask for the missing detail.
+- Use draft tools for write operations unless the user explicitly asks to create/log immediately.
+
+Routing:
+- Own profile/account/who am I -> get_my_profile.
+- My projects / projects I am in -> list_my_projects.
+- Members/developers/roster on a project -> list_project_members.
+- Projects for a named person -> list_user_projects.
+- My issues/tasks/open work -> list_my_issues.
+- Search by issue keyword/topic/subject -> search_issues; numeric issue refs -> get_issue.
+- Urgent/high/blocker/critical issues -> search_high_priority_issues.
+- Project health/status/open or closed counts -> get_project_status.
+- Who manages/leads/is PM of a project -> get_project_manager.
+- My logged hours -> get_my_time_logged.
+- A named person's logged hours -> get_user_time_logged.
+- Total/team hours on a project -> get_project_time_logged.
+- Per-person/member/developer time breakdown on a project -> get_project_time_by_member.
+- Most recent date someone logged time -> get_last_logged_day, not a time-summary tool.
+- Log/add/record time -> draft_time_entry unless the user explicitly asks to log now and gives hours.
+- Create/raise/report an issue -> draft_issue unless the user explicitly asks to create immediately.
+
+Date and entity handling:
+- Put dates and ranges in date_range, not project_identifier_or_id.
+- Use empty strings for optional filters that were not mentioned.
+- If a project name contains a date-looking word such as "all" in "Phun For All", keep the full project name.
+- If hours are missing for time logging, call draft_time_entry with hours=0 so the tool asks for hours.
+
+Pending drafts:
+- Pending-draft follow-ups are Redmine-related.
+- If the context says an issue draft is pending, use update_pending_issue_project for project changes and approve_pending_draft when the user approves creation.
+- If the context says a time-entry draft is pending, use update_pending_time_entry for missing or changed details and approve_pending_draft when the user approves logging.
+- For pending time entries, map "billable hours" to billable_hours and "time entry comment(s)" to time_entry_comments.
+- Do not start a new draft for a short follow-up that clearly refers to the pending draft.
+
+Pending clarifications:
+- If the context says a previous tool is missing one argument, treat the user's reply as that missing value unless the user clearly asks a new unrelated question.
+- Preserve the previous tool arguments when completing the clarified tool call.
 """
 
 
@@ -2451,13 +2346,18 @@ def main() -> None:
         if not question or question.lower() in {"quit", "exit", "q"}:
             break
 
-        if get_pending_draft():
-            handled = _handle_pending_draft_followup(question)
-            if handled is not None:
-                print(f"\n[Redmine Agent]: {handled}\n")
-                continue
+        pending_context_parts = [
+            context
+            for context in (_pending_draft_context(), _pending_clarification_context())
+            if context
+        ]
+        if pending_context_parts:
+            pending_context = "\n\n".join(pending_context_parts)
+            question_for_agent = f"{pending_context}\n\nUser reply: {question}"
+        else:
+            question_for_agent = question
 
-        answer = run_agent_turn(agent, question, ALL_TOOLS)
+        answer = run_agent_turn(agent, question_for_agent, ALL_TOOLS)
         print(f"\n[Redmine Agent]: {answer}\n")
 
     print("Bye!")
